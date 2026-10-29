@@ -8,15 +8,13 @@ import {
 	normalizeContentsBlocks,
 } from './contents.js';
 import { getReferenceLists } from './reference/reference.js';
-import { getFigureAndMathCandidates } from './citations.js';
-import { getFigures } from './figure.js';
-import { getMathBlocks } from './math.js';
+import { addObjectRefs } from './object-refs.js';
 import { updateRegularWordsSet } from './reference/regular-words.js';
 import { getReferenceIndex } from './reference/index.js';
 import { getSupportedReferenceLists } from './reference/support.js';
 // import { getLinkOverlays } from './link.js';
 import { addPageLabels } from './page-label.js';
-import { applyRefs, getRefsList } from './apply-refs.js';
+import { applyRefs } from './apply-refs.js';
 import { getCitationRefs } from './citation-refs.js';
 import { getFootnoteRefs } from './footnote-refs.js';
 import {
@@ -160,7 +158,7 @@ export async function getFullStructure(pdfDocument, onnxRuntimeProvider, modelPr
 	let catalogPageLabels = await pdfDocument.pdfManager.ensureCatalog("pageLabels");
 	let nativeOutline = await getNativeOutline(pdfDocument);
 	let pageContentLengths = new Array(pageCount).fill(0);
-	let inferredHeadings = [];
+	let contentsCandidates = [];
 	let contentsContexts = [];
 	const contentsNavigationRegions = [];
 	const rasterTextPageIndexes = new Set();
@@ -304,7 +302,7 @@ export async function getFullStructure(pdfDocument, onnxRuntimeProvider, modelPr
 		reportPageProgress(onProgress, pagesProcessed, pageCount);
 	}
 
-	function collectInferredHeadings(context) {
+	function collectContentsCandidates(context) {
 		let fragments = [];
 		function flush() {
 			if (!fragments.length) return;
@@ -316,7 +314,13 @@ export async function getFullStructure(pdfDocument, onnxRuntimeProvider, modelPr
 					end++
 				) {
 					title = `${title} ${fragments[end].title}`.trim();
-					inferredHeadings.push({ title, _pageIndex: context.i });
+					const sourceBlocks = fragments.slice(start, end + 1).map(fragment => fragment.block);
+					contentsCandidates.push({
+						title,
+						_pageIndex: context.i,
+						_sourceBlocks: sourceBlocks,
+						_requiresLink: sourceBlocks.some(block => block.type !== 'title'),
+					});
 				}
 			}
 			fragments = [];
@@ -341,7 +345,7 @@ export async function getFullStructure(pdfDocument, onnxRuntimeProvider, modelPr
 			return horizontalOverlap > 0 && verticalGap <= height;
 		}
 		for (const block of context.blocks || []) {
-			if (block.type !== 'title') {
+			if (block.type !== 'title' && block.type !== 'body') {
 				flush();
 				continue;
 			}
@@ -446,13 +450,14 @@ export async function getFullStructure(pdfDocument, onnxRuntimeProvider, modelPr
 		}
 
 		for (let context of contexts) {
-			collectInferredHeadings(context);
+			collectContentsCandidates(context);
 			contentsContexts.push({
 				i: context.i,
 				lines: context.lines.map(line => ({
 					id: line.id,
 					text: line.text,
 					rect: line.rect,
+					words: line.words.map(word => ({ text: word.text, rect: word.rect })),
 					startOffset: line.startOffset,
 					endOffset: line.endOffset,
 				})),
@@ -465,7 +470,7 @@ export async function getFullStructure(pdfDocument, onnxRuntimeProvider, modelPr
 	}
 
 	// Confirm printed navigation only after inference has seen the whole PDF.
-	const headingIndex = createContentsHeadingIndex(inferredHeadings);
+	const headingIndex = createContentsHeadingIndex(contentsCandidates);
 	const contentsRegionsByPage = new Map(detectContentsRegions(contentsContexts.map(context => ({
 		pageIndex: context.i,
 		lines: context.lines,
@@ -497,6 +502,8 @@ export async function getFullStructure(pdfDocument, onnxRuntimeProvider, modelPr
 		await appendPageContext({ ...context, chars, page }, true);
 	}
 	contentsContexts = null;
+	contentsCandidates = null;
+	headingIndex.clear();
 
 	let contentOffset = 0;
 	for (let pageIndex = 0; pageIndex < pageCount; pageIndex++) {
@@ -520,7 +527,6 @@ export async function getFullStructure(pdfDocument, onnxRuntimeProvider, modelPr
 
 	addPageLabels(structure, catalogPageLabels);
 
-	let candidateGroups = new Map();
 	let structureIndex = createStructureIndex(structure, options.structureIndex);
 
 	let annotLinkRefs = getAnnotLinkRefs(structure, linkMap, structureIndex);
@@ -550,15 +556,10 @@ export async function getFullStructure(pdfDocument, onnxRuntimeProvider, modelPr
 	}
 	let referenceIndex = getReferenceIndex(referenceLists, regularWordsSet);
 	let citationRefs = getCitationRefs(structure, referenceIndex, annotLinkRefs, structureIndex);
-	let figures = getFigures(structure);
-	let mathBlocks = getMathBlocks(structure);
-	getFigureAndMathCandidates(structure, candidateGroups, figures, mathBlocks, structureIndex);
-	structureIndex.clearPageTextCache();
-	let mainRefs = getRefsList(candidateGroups);
-
 	addRefs(annotLinkRefs, parsedLinkRefs);
-	addRefs(citationRefs, mainRefs);
 	addRefs(citationRefs, annotLinkRefs);
+	addObjectRefs(structure, citationRefs, structureIndex);
+	structureIndex.clearPageTextCache();
 	addRefs(citationRefs, getFootnoteRefs(structure, citationRefs, structureIndex));
 
 	applyRefs(structure, citationRefs);

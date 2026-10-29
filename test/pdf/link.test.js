@@ -6,6 +6,7 @@ import {
 	getUnderlyingTextRange,
 	getUnderlyingTextRanges,
 } from '../../src/pdf/structure/link.js';
+import { addObjectRefs } from '../../src/pdf/structure/object-refs.js';
 
 function blockText(text, glyphs, pageIndex = 0) {
 	let rects = Array(text.length).fill(null);
@@ -28,6 +29,37 @@ function horizontalBlockText(text, pageIndex = 0) {
 }
 
 describe('PDF annotation links', () => {
+	it('resolves figure panels conservatively, preferring exact labels', () => {
+		for (const [mention, captions, expected] of [
+			['Fig. 3b', ['Fig. 3. a, First panel; b, Second panel.'], [1]],
+			['Fig. 3b', ['Fig. 3. a, First panel.', 'Fig. 3b. Exact panel.'], [2]],
+			['Fig. 3b', ['Fig. 3. a, First panel.', 'Fig. 3. a, Other figure.'], null],
+			['Fig. 3.2', ['Fig. 3. a, First panel.'], null],
+			['Fig. 3b', ['Fig. 3. A single diagram using f(x).'], null],
+		]) {
+			const structure = { content: [
+				{ type: 'paragraph', content: [{ text: mention }] },
+				...captions.map(text => ({ type: 'caption', content: [{ text }] })),
+			] };
+			const refs = new Map();
+			addObjectRefs(structure, refs);
+			assert.deepEqual(refs.get('0')?.map(ref => ref.dest.blockRef) || [], expected ? [expected] : [], mention);
+		}
+	});
+
+	it('keeps explicit figure references in captions and prose list items', () => {
+		const structure = { content: [
+			{ type: 'caption', flowClass: 'auxiliary', content: [{ text: 'Figure 2. A view of Figure 1.' }] },
+			{ type: 'list', content: [{ type: 'listitem', content: [{ text: 'See Figure 1.' }] }] },
+			{ type: 'caption', content: [{ text: 'Figure 1. The original view.' }] },
+		] };
+		const refs = new Map();
+		addObjectRefs(structure, refs);
+		assert.deepEqual(refs.get('0')?.map(ref => ref.dest.blockRef), [[2]]);
+		assert.deepEqual(refs.get('1,0')?.map(ref => ref.dest.blockRef), [[2]]);
+		assert.equal(refs.has('2'), false);
+	});
+
 	it('uses annotation quad points as precise source rectangles', async () => {
 		let page = {
 			pageIndex: 2,
@@ -221,6 +253,40 @@ describe('PDF annotation links', () => {
 		});
 
 		assert.deepEqual(range, { offsetStart: null, offsetEnd: null, text: '' });
+	});
+
+	it('resolves the nearest occurrence to the authored destination, including outside headings', () => {
+		for (const includeHeading of [false, true]) {
+			const sourceEntries = [{
+				blockRef: [0],
+				blockRefKey: '0',
+				bt: horizontalBlockText('12'),
+				pageRect: [0, 0, 2, 1],
+			}];
+			const destinationEntries = [{
+				blockRef: [1],
+				block: { type: 'paragraph' },
+				bt: horizontalBlockText('12 12', 1),
+			}];
+			if (includeHeading) {
+				destinationEntries.push({
+					blockRef: [2],
+					block: { type: 'heading' },
+					bt: blockText('12', [[0, [0, 100, 1, 101]], [1, [1, 100, 2, 101]]], 1),
+				});
+			}
+			const structureIndex = {
+				withPageEntries(pageIndex, callback) {
+					return callback(pageIndex === 0 ? sourceEntries : destinationEntries);
+				},
+			};
+			const refs = getAnnotLinkRefs({}, new Map([[0, [{
+				src: { pageIndex: 0, rect: [0, 0, 2, 1] },
+				dest: { pageIndex: 1, rect: [3, 0, 3, 1] },
+			}]]]), structureIndex);
+
+			assert.deepEqual(refs.get('0')[0].dest, { blockRef: [1], offsetStart: 3, offsetEnd: 4 });
+		}
 	});
 
 	it('discards conflicting destinations resolved from one disjoint internal link', () => {
